@@ -1,0 +1,21 @@
+# 整理时自动添加（2026-10-22）
+__pycache__/
+*.py[cod]
+node_modules/
+.venv/
+venv/
+site-packages/
+dist/
+build/
+*.log
+*.tmp
+~$*
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+
+# 隐私数据：本地口令 / 配置文件，切勿提交
+dida365-widget/config.json
+.acl-recovery/

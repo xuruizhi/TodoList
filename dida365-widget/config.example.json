@@ -1,0 +1,19 @@
+{
+  "access_token": "",
+  "window": {
+    "x": 101,
+    "y": 18,
+    "width": 579,
+    "height": null
+  },
+  "refresh_minutes": 60,
+  "show_completed": true,
+  "topmost": false,
+  "font": {
+    "family": "HarmonyOS Sans SC",
+    "size": 12,
+    "text_color": "#1E293B",
+    "accent_color": "#3B82F6"
+  },
+  "pythonw_path": ""
+}
