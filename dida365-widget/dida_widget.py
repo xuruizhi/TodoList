@@ -359,6 +359,12 @@ class Widget:
         self._place_window()
         self.root.deiconify()
 
+        # 开机自启自愈：程序搬家/改名后，若曾启用自启，自动把 bat 重写到当前路径
+        try:
+            self._repair_autostart_if_needed()
+        except Exception as e:
+            log("开机自启自愈检查异常(忽略): %r" % e)
+
         if not self.cfg.get("access_token"):
             self.root.after(300, self.open_settings)
 
@@ -1266,18 +1272,74 @@ class Widget:
         return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs",
                             "Startup", "dida-widget.bat")
 
+    # bat 内用于记录「启动目标」的标记行前缀，便于读取校验与自愈重写
+    _AUTOSTART_TAG = "REM DIDA_TARGET="
+
+    def _autostart_target(self):
+        """返回开机自启应执行的完整命令行（随程序当前位置变化）。
+
+        打包版：直接启动 exe；源码版：用 pythonw 启动 .py。
+        返回形如 (command_line, target_path)，target_path 用于存在性校验。
+        """
+        if FROZEN:
+            target = os.path.abspath(sys.executable)
+            return '@start "" "%s"' % target, target
+        # 源码版：优先用配置里记录的 pythonw，但若其已失效（Python 换路径/卸载）则回退探测
+        pyw = self.cfg.get("pythonw_path") or ""
+        if not pyw or not os.path.exists(pyw):
+            pyw = shutil.which("pythonw") or shutil.which("python") or sys.executable
+        script = os.path.abspath(os.path.join(APP_DIR, "dida_widget.py"))
+        return '@start "" "%s" "%s"' % (pyw, script), script
+
+    def _read_autostart(self):
+        """读取现有自启 bat 记录的目标路径；无文件或无标记返回 None。"""
+        p = self._startup_bat_path()
+        try:
+            with open(p, "r", encoding="mbcs", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(self._AUTOSTART_TAG):
+                        return line[len(self._AUTOSTART_TAG):].strip()
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            log("读取开机启动文件失败: %r" % e)
+        return None
+
+    def _autostart_exists(self):
+        """仅当自启 bat 存在、且其记录的目标路径与『当前程序路径』一致且真实存在时，才算已启用。
+
+        这样程序被移动/改名后，旧 bat 指向失效路径，会被判定为『未启用』，
+        菜单里的勾选状态与实际一致，且下次启动可自愈重写。
+        """
+        recorded = self._read_autostart()
+        if not recorded:
+            return False
+        _, current = self._autostart_target()
+        # 记录路径与当前路径一致，且该文件确实存在 → 有效
+        return os.path.normcase(recorded) == os.path.normcase(current) and os.path.exists(current)
+
+    def _write_autostart_bat(self):
+        """按当前程序路径重写自启 bat。返回 (command_line, target_path)。"""
+        cmdline, target = self._autostart_target()
+        content = (
+            "@echo off\r\n"
+            "rem 由程序自动生成的开机自启脚本，请勿手动编辑\r\n"
+            "%s%s\r\n"
+            "if not exist \"%s\" exit /b 0\r\n"
+            "%s\r\n"
+        ) % (self._AUTOSTART_TAG, target, target, cmdline)
+        # 用系统 ANSI 编码写，兼容含中文的用户名/路径（ascii 会在中文路径上抛 UnicodeEncodeError）
+        with open(self._startup_bat_path(), "w", encoding="mbcs") as f:
+            f.write(content)
+        return cmdline, target
+
     def _add_autostart(self):
         try:
-            if FROZEN:
-                content = '@echo off\r\nstart "" "%s"\r\n' % sys.executable
-            else:
-                pyw = self.cfg.get("pythonw_path") or shutil.which("pythonw") or sys.executable
-                script = os.path.join(APP_DIR, "dida_widget.py")
-                content = '@echo off\r\nstart "" "%s" "%s"\r\n' % (pyw, script)
-            with open(self._startup_bat_path(), "w", encoding="ascii") as f:
-                f.write(content)
+            cmdline, target = self._write_autostart_bat()
             if not FROZEN:
-                self.cfg["pythonw_path"] = pyw
+                # 记录 pythonw 绝对路径；移动环境后由 _autostart_exists 判定失效并自愈
+                self.cfg["pythonw_path"] = self.cfg.get("pythonw_path") or shutil.which("pythonw") or sys.executable
             save_config()
             self.status_bar.configure(text="已添加到开机启动", fg=COLOR_SUB)
         except Exception as e:
@@ -1293,6 +1355,42 @@ class Widget:
         except Exception as e:
             log("移除开机启动失败: %r" % e)
             self.status_bar.configure(text="移除开机启动失败：%s" % e, fg=COLOR_DANGER)
+
+    def _repair_autostart_if_needed(self):
+        """程序启动时调用：把自启 bat 校正到当前程序路径，实现『程序搬家后自启自动跟随』。
+
+        处理三种情况：
+        1. 新格式 bat（含 DIDA_TARGET 标记）记录路径 == 当前路径：无需动作；
+        2. 新格式 bat 记录路径 != 当前路径（程序搬过家）：按当前路径重写；
+        3. 旧格式 bat（无标记，旧版本程序生成）：若其内容指向本程序（含 DidaWidget.exe
+           或 dida_widget.py），视为『曾启用自启』，升级为新格式并校正到当前路径。
+        非本程序生成的 bat 不动。
+        """
+        p = self._startup_bat_path()
+        if not os.path.exists(p):
+            return
+        _, current = self._autostart_target()
+        recorded = self._read_autostart()
+        try:
+            if recorded is not None:
+                # 新格式：仅当路径变化时重写
+                if os.path.normcase(recorded) != os.path.normcase(current) and os.path.exists(current):
+                    self._write_autostart_bat()
+                    log("开机自启已按新路径自愈重写: %s" % current)
+                return
+            # 旧格式（无标记）：确认确实是本程序生成的才接管升级
+            with open(p, "r", encoding="mbcs", errors="replace") as f:
+                body = f.read()
+            prog = os.path.basename(current)
+            script_name = os.path.basename(os.path.abspath(os.path.join(APP_DIR, "dida_widget.py")))
+            if (prog and prog.lower() in body.lower()) or (script_name.lower() in body.lower()):
+                if os.path.exists(current):
+                    self._write_autostart_bat()
+                    log("旧格式开机自启已升级并校正到当前路径: %s" % current)
+        except Exception as e:
+            log("开机启动自愈失败: %r" % e)
+
+
 
     # ---------------- 退出
 
