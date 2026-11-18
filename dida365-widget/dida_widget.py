@@ -342,6 +342,10 @@ class Widget:
         self.drag_info = None
         self._refresh_job = None
         self._chrome = None
+        # 标题过长时的悬停浮窗状态
+        self._tip_win = None
+        self._tip_job = None
+        self._tip_shown_for = None
         self.th = self._load_theme()
 
         self.root = tk.Tk()
@@ -728,6 +732,10 @@ class Widget:
     # ---------------- 渲染
 
     def _render(self):
+        # 重绘前先收起悬停浮窗（行被销毁后浮窗会失去依附）
+        self._cancel_tip()
+        self._hide_title_tip()
+
         # 记录当前滚动位置，刷新后保持（避免每次自动刷新跳回顶部）
         try:
             scroll_frac = self.canvas.yview()[0]
@@ -841,11 +849,12 @@ class Widget:
         time_label.pack(side="right", padx=(6, 10))
 
         # 标题
-        title = (t.get("title") or "").strip() or "(无标题)"
+        full_title = (t.get("title") or "").strip() or "(无标题)"
         tf = tkfont.Font(family=th["family"], size=th["size"], overstrike=completed)
         avail = self._win_w() - 140
-        title = truncate(title, tf, avail)
-        title_label = tk.Label(row, text=title, bg=COLOR_BG, fg=fg, font=title_font, anchor="w")
+        shown_title = truncate(full_title, tf, avail)
+        truncated = shown_title != full_title          # 是否因过长被截断
+        title_label = tk.Label(row, text=shown_title, bg=COLOR_BG, fg=fg, font=title_font, anchor="w")
         title_label.pack(side="left", fill="both", expand=True, padx=(2, 2))
 
         # 绑定交互
@@ -861,16 +870,103 @@ class Widget:
             for c in r.winfo_children():
                 if isinstance(c, tk.Label):
                     c.configure(bg=COLOR_HOVER)
+            # 标题被截断时，悬停 1 秒后弹出浮窗显示全文
+            if truncated:
+                self._schedule_tip(full_title, e)
 
         def _leave(e, r=row):
             r.configure(bg=COLOR_BG)
             for c in r.winfo_children():
                 if isinstance(c, tk.Label):
                     c.configure(bg=COLOR_BG)
+            if truncated:
+                self._cancel_tip()
+                self._hide_title_tip()
 
         for w in (row, box, dot, title_label):
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
+
+    # ---------------- 标题悬停浮窗（显示被截断的完整标题）
+
+    TIP_DELAY_MS = 1000      # 悬停多久后弹出
+    TIP_MAX_W = 460          # 浮窗文字最大宽度（像素）
+    TIP_WRAP_PX = 420        # 文字换行宽度
+
+    def _schedule_tip(self, text, event):
+        """鼠标进入被截断的行：1 秒后弹出全文浮窗。重复进入会重置计时。"""
+        self._cancel_tip()
+        self._hide_title_tip()
+        self._tip_job = self.root.after(
+            self.TIP_DELAY_MS, lambda: self._show_title_tip(text, event))
+
+    def _cancel_tip(self):
+        """取消尚未触发的弹出计时。"""
+        if self._tip_job is not None:
+            try:
+                self.root.after_cancel(self._tip_job)
+            except Exception:
+                pass
+            self._tip_job = None
+
+    def _show_title_tip(self, text, event=None):
+        """在鼠标位置附近弹出无边框浮窗，显示完整标题（自动换行）。"""
+        self._tip_job = None
+        try:
+            self._hide_title_tip()
+            th = self.th
+            win = tk.Toplevel(self.root)
+            win.withdraw()
+            win.overrideredirect(True)
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            # 外框 1px 细边 + 内白底，和主窗口观感一致
+            border = tk.Frame(win, bg="#CBD5E1")
+            border.pack(fill="both", expand=True)
+            label = tk.Label(
+                border, text=text, bg="#FFFFFF", fg=th["text"],
+                font=(th["family"], th["size"]),
+                justify="left", anchor="w",
+                wraplength=self.TIP_WRAP_PX,
+                padx=10, pady=8,
+            )
+            label.pack(padx=1, pady=1)
+
+            win.update_idletasks()
+            tw, tht = win.winfo_reqwidth(), win.winfo_reqheight()
+
+            # 定位：优先放在鼠标右下方；贴边时翻转，保证不超出屏幕
+            if event is not None:
+                mx, my = event.x_root, event.y_root
+            else:
+                mx, my = self.root.winfo_pointerx(), self.root.winfo_pointery()
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            x = mx + 14
+            y = my + 18
+            if x + tw > sw - 8:
+                x = max(8, mx - tw - 14)
+            if y + tht > sh - 8:
+                y = max(8, my - tht - 18)
+
+            win.geometry("%dx%d+%d+%d" % (tw, tht, x, y))
+            win.deiconify()
+            self._tip_win = win
+            self._tip_shown_for = text
+        except Exception as e:
+            log("显示标题浮窗失败(忽略): %r" % e)
+
+    def _hide_title_tip(self):
+        """收起浮窗。"""
+        w = getattr(self, "_tip_win", None)
+        self._tip_win = None
+        self._tip_shown_for = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
 
     # ---------------- 窗口置顶
 
@@ -1399,6 +1495,12 @@ class Widget:
             self.cfg["window"]["x"] = self.root.winfo_x()
             self.cfg["window"]["y"] = self.root.winfo_y()
             save_config()
+        except Exception:
+            pass
+        # 退出前收掉悬停浮窗与计时器，避免残留窗口
+        try:
+            self._cancel_tip()
+            self._hide_title_tip()
         except Exception:
             pass
         self.root.destroy()
